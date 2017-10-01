@@ -1,4 +1,4 @@
-// Ogg Vorbis audio decoder - v1.07 - public domain
+// Ogg Vorbis audio decoder - v1.11 - public domain
 // http://nothings.org/stb_vorbis/
 //
 // Original version written by Sean Barrett in 2007.
@@ -9,12 +9,7 @@
 //
 // LICENSE
 //
-//   This software is dual-licensed to the public domain and under the following
-//   license: you are granted a perpetual, irrevocable license to copy, modify,
-//   publish, and distribute this file as you see fit.
-//
-// No warranty for any purpose is expressed or implied by the author (nor
-// by RAD Game Tools). Report bugs and send enhancements to the author.
+//   See end of file for license information.
 //
 // Limitations:
 //
@@ -31,11 +26,16 @@
 //    Terje Mathisen     Niklas Frykholm     Andy Hill
 //    Casey Muratori     John Bolton         Gargaj
 //    Laurent Gomila     Marc LeBlanc        Ronny Chevalier
-//    Bernhard Wodo      Evan Balster        "alxprd"@github
+//    Bernhard Wodo      Evan Balster        alxprd@github
 //    Tom Beaumont       Ingo Leitgeb        Nicolas Guillemot
-//    Phillip Bennefall  Rohit
+//    Phillip Bennefall  Rohit               Thiago Goulart
+//    manxorist@github   saga musix          github:infatum
 //
 // Partial history:
+//    1.11    - 2017/07/23 - fix MinGW compilation 
+//    1.10    - 2017/03/03 - more robust seeking; fix negative ilog(); clear error in open_memory
+//    1.09    - 2016/04/04 - back out 'truncation of last frame' fix from previous version
+//    1.08    - 2016/04/02 - warnings; setup memory leaks; truncation of last frame
 //    1.07    - 2015/01/16 - fixes for crashes on invalid files; warning fixes; const
 //    1.06    - 2015/08/31 - full, correct support for seeking API (Dougall Johnson)
 //                           some crash fixes when out of memory or with corrupt files
@@ -272,7 +272,7 @@ extern int stb_vorbis_seek(stb_vorbis *f, unsigned int sample_number);
 // do not need to seek to EXACTLY the target sample when using get_samples_*,
 // you can also use seek_frame().
 
-extern void stb_vorbis_seek_start(stb_vorbis *f);
+extern int stb_vorbis_seek_start(stb_vorbis *f);
 // this function is equivalent to stb_vorbis_seek(f,0)
 
 extern unsigned int stb_vorbis_stream_length_in_samples(stb_vorbis *f);
@@ -546,18 +546,23 @@ enum STBVorbisError
 #endif
 
 #ifndef STB_VORBIS_NO_CRT
-#include <stdlib.h>
-#include <string.h>
-#include <assert.h>
-#include <math.h>
-#if !(defined(__APPLE__) || defined(MACOSX) || defined(macintosh) || defined(Macintosh))
-#include <malloc.h>
-#endif
+   #include <stdlib.h>
+   #include <string.h>
+   #include <assert.h>
+   #include <math.h>
+
+   // find definition of alloca if it's not in stdlib.h:
+   #if defined(_MSC_VER) || defined(__MINGW32__)
+      #include <malloc.h>
+   #endif
+   #if defined(__linux__) || defined(__linux) || defined(__EMSCRIPTEN__)
+      #include <alloca.h>
+   #endif
 #else // STB_VORBIS_NO_CRT
-#define NULL 0
-#define malloc(s)   0
-#define free(s)     ((void) 0)
-#define realloc(s)  0
+   #define NULL 0
+   #define malloc(s)   0
+   #define free(s)     ((void) 0)
+   #define realloc(s)  0
 #endif // STB_VORBIS_NO_CRT
 
 #include <limits.h>
@@ -572,6 +577,7 @@ enum STBVorbisError
    #undef __forceinline
    #endif
    #define __forceinline
+   #define alloca __builtin_alloca
 #elif !defined(_MSC_VER)
    #if __GNUC__
       #define __forceinline inline
@@ -978,17 +984,18 @@ static int ilog(int32 n)
 {
    static signed char log2_4[16] = { 0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4 };
 
+   if (n < 0) return 0; // signed n returns 0
+
    // 2 compares if n < 16, 3 compares otherwise (4 if signed or n > 1<<29)
    if (n < (1 << 14))
-        if (n < (1 <<  4))        return     0 + log2_4[n      ];
-        else if (n < (1 <<  9))      return  5 + log2_4[n >>  5];
+        if (n < (1 <<  4))            return  0 + log2_4[n      ];
+        else if (n < (1 <<  9))       return  5 + log2_4[n >>  5];
              else                     return 10 + log2_4[n >> 10];
    else if (n < (1 << 24))
-             if (n < (1 << 19))      return 15 + log2_4[n >> 15];
+             if (n < (1 << 19))       return 15 + log2_4[n >> 15];
              else                     return 20 + log2_4[n >> 20];
-        else if (n < (1 << 29))      return 25 + log2_4[n >> 25];
-             else if (n < (1 << 31)) return 30 + log2_4[n >> 30];
-                  else                return 0; // signed n returns 0
+        else if (n < (1 << 29))       return 25 + log2_4[n >> 25];
+             else                     return 30 + log2_4[n >> 30];
 }
 
 #ifndef M_PI
@@ -1261,13 +1268,13 @@ static void neighbors(uint16 *x, int n, int *plow, int *phigh)
 // this has been repurposed so y is now the original index instead of y
 typedef struct
 {
-   uint16 x,y;
-} Point;
+   uint16 x,id;
+} stbv__floor_ordering;
 
 static int STBV_CDECL point_compare(const void *p, const void *q)
 {
-   Point *a = (Point *) p;
-   Point *b = (Point *) q;
+   stbv__floor_ordering *a = (stbv__floor_ordering *) p;
+   stbv__floor_ordering *b = (stbv__floor_ordering *) q;
    return a->x < b->x ? -1 : a->x > b->x;
 }
 
@@ -1868,85 +1875,6 @@ static int codebook_decode_deinterleave_repeat(vorb *f, Codebook *c, float **out
    return TRUE;
 }
 
-#ifndef STB_VORBIS_DIVIDES_IN_CODEBOOK
-static int codebook_decode_deinterleave_repeat_2(vorb *f, Codebook *c, float **outputs, int *c_inter_p, int *p_inter_p, int len, int total_decode)
-{
-   int c_inter = *c_inter_p;
-   int p_inter = *p_inter_p;
-   int i,z, effective = c->dimensions;
-
-   // type 0 is only legal in a scalar context
-   if (c->lookup_type == 0)   return error(f, VORBIS_invalid_stream);
-
-   while (total_decode > 0) {
-      float last = CODEBOOK_ELEMENT_BASE(c);
-      DECODE_VQ(z,f,c);
-
-      if (z < 0) {
-         if (!f->bytes_in_seg)
-            if (f->last_seg) return FALSE;
-         return error(f, VORBIS_invalid_stream);
-      }
-
-      // if this will take us off the end of the buffers, stop short!
-      // we check by computing the length of the virtual interleaved
-      // buffer (len*ch), our current offset within it (p_inter*ch)+(c_inter),
-      // and the length we'll be using (effective)
-      if (c_inter + p_inter*2 + effective > len * 2) {
-         effective = len*2 - (p_inter*2 - c_inter);
-      }
-
-      {
-         z *= c->dimensions;
-         if (c->sequence_p) {
-            // haven't optimized this case because I don't have any examples
-            for (i=0; i < effective; ++i) {
-               float val = CODEBOOK_ELEMENT_FAST(c,z+i) + last;
-               if (outputs[c_inter])
-                  outputs[c_inter][p_inter] += val;
-               if (++c_inter == 2) { c_inter = 0; ++p_inter; }
-               last = val;
-            }
-         } else {
-            i=0;
-            if (c_inter == 1 && i < effective) {
-               float val = CODEBOOK_ELEMENT_FAST(c,z+i) + last;
-               if (outputs[c_inter])
-                  outputs[c_inter][p_inter] += val;
-               c_inter = 0; ++p_inter;
-               ++i;
-            }
-            {
-               float *z0 = outputs[0];
-               float *z1 = outputs[1];
-               for (; i+1 < effective;) {
-                  float v0 = CODEBOOK_ELEMENT_FAST(c,z+i) + last;
-                  float v1 = CODEBOOK_ELEMENT_FAST(c,z+i+1) + last;
-                  if (z0)
-                     z0[p_inter] += v0;
-                  if (z1)
-                     z1[p_inter] += v1;
-                  ++p_inter;
-                  i += 2;
-               }
-            }
-            if (i < effective) {
-               float val = CODEBOOK_ELEMENT_FAST(c,z+i) + last;
-               if (outputs[c_inter])
-                  outputs[c_inter][p_inter] += val;
-               if (++c_inter == 2) { c_inter = 0; ++p_inter; }
-            }
-         }
-      }
-
-      total_decode -= effective;
-   }
-   *c_inter_p = c_inter;
-   *p_inter_p = p_inter;
-   return TRUE;
-}
-#endif
-
 static int predict_point(int x, int x0, int x1, int y0, int y1)
 {
    int dy = y1 - y0;
@@ -2325,6 +2253,11 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
    }
   done:
    CHECK(f);
+   #ifndef STB_VORBIS_DIVIDES_IN_RESIDUE
+   temp_free(f,part_classdata);
+   #else
+   temp_free(f,classifications);
+   #endif
    temp_alloc_restore(f,temp_alloc_point);
 }
 
@@ -2970,6 +2903,7 @@ static void inverse_mdct(float *buffer, int n, vorb *f, int blocktype)
       }
    }
 
+   temp_free(f,buf2);
    temp_alloc_restore(f,save_point);
 }
 
@@ -3549,11 +3483,13 @@ static int vorbis_finish_frame(stb_vorbis *f, int len, int left, int right)
    return right - left;
 }
 
-static void vorbis_pump_first_frame(stb_vorbis *f)
+static int vorbis_pump_first_frame(stb_vorbis *f)
 {
-   int len, right, left;
-   if (vorbis_decode_packet(f, &len, &left, &right))
+   int len, right, left, res;
+   res = vorbis_decode_packet(f, &len, &left, &right);
+   if (res)
       vorbis_finish_frame(f, len, left, right);
+   return res;
 }
 
 #ifndef STB_VORBIS_NO_PUSHDATA_API
@@ -3883,7 +3819,6 @@ static int start_decoder(vorb *f)
                   }
                }
             }
-            setup_temp_free(f, mults,sizeof(mults[0])*c->lookup_values);
             c->lookup_type = 2;
          }
          else
@@ -3899,11 +3834,11 @@ static int start_decoder(vorb *f)
                if (c->sequence_p)
                   last = val;
             }
-            setup_temp_free(f, mults,sizeof(mults[0])*c->lookup_values);
          }
 #ifndef STB_VORBIS_DIVIDES_IN_CODEBOOK
         skip:;
 #endif
+         setup_temp_free(f, mults, sizeof(mults[0])*c->lookup_values);
 
          CHECK(f);
       }
@@ -3937,7 +3872,7 @@ static int start_decoder(vorb *f)
             g->book_list[j] = get_bits(f,8);
          return error(f, VORBIS_feature_not_supported);
       } else {
-         Point p[31*8+2];
+         stbv__floor_ordering p[31*8+2];
          Floor1 *g = &f->floor_config[i].floor1;
          int max_class = -1; 
          g->partitions = get_bits(f, 5);
@@ -3973,11 +3908,11 @@ static int start_decoder(vorb *f)
          // precompute the sorting
          for (j=0; j < g->values; ++j) {
             p[j].x = g->Xlist[j];
-            p[j].y = j;
+            p[j].id = j;
          }
          qsort(p, g->values, sizeof(p[0]), point_compare);
          for (j=0; j < g->values; ++j)
-            g->sorted_order[j] = (uint8) p[j].y;
+            g->sorted_order[j] = (uint8) p[j].id;
          // precompute the neighbors
          for (j=2; j < g->values; ++j) {
             int low,hi;
@@ -4429,7 +4364,7 @@ int stb_vorbis_decode_frame_pushdata(
          while (get8_packet(f) != EOP)
             if (f->eof) break;
          *samples = 0;
-         return f->stream - data;
+         return (int) (f->stream - data);
       }
       if (error == VORBIS_continued_packet_flag_invalid) {
          if (f->previous_length == 0) {
@@ -4439,7 +4374,7 @@ int stb_vorbis_decode_frame_pushdata(
             while (get8_packet(f) != EOP)
                if (f->eof) break;
             *samples = 0;
-            return f->stream - data;
+            return (int) (f->stream - data);
          }
       }
       // if we get an error while parsing, what to do?
@@ -4459,7 +4394,7 @@ int stb_vorbis_decode_frame_pushdata(
    if (channels) *channels = f->channels;
    *samples = len;
    *output = f->outputs;
-   return f->stream - data;
+   return (int) (f->stream - data);
 }
 
 stb_vorbis *stb_vorbis_open_pushdata(
@@ -4482,7 +4417,7 @@ stb_vorbis *stb_vorbis_open_pushdata(
    f = vorbis_alloc(&p);
    if (f) {
       *f = p;
-      *data_used = f->stream - data;
+      *data_used = (int) (f->stream - data);
       *error = 0;
       return f;
    } else {
@@ -4497,9 +4432,9 @@ unsigned int stb_vorbis_get_file_offset(stb_vorbis *f)
    #ifndef STB_VORBIS_NO_PUSHDATA_API
    if (f->push_mode) return 0;
    #endif
-   if (USE_MEMORY(f)) return f->stream - f->stream_start;
+   if (USE_MEMORY(f)) return (unsigned int) (f->stream - f->stream_start);
    #ifndef STB_VORBIS_NO_STDIO
-   return ftell(f->f) - f->f_start;
+   return (unsigned int) (ftell(f->f) - f->f_start);
    #endif
 }
 
@@ -4681,8 +4616,9 @@ static int seek_to_sample_coarse(stb_vorbis *f, uint32 sample_number)
 
    // starting from the start is handled differently
    if (sample_number <= left.last_decoded_sample) {
-      stb_vorbis_seek_start(f);
-      return 1;
+      if (stb_vorbis_seek_start(f))
+         return 1;
+      return 0;
    }
 
    while (left.page_end != right.page_start) {
@@ -4783,7 +4719,10 @@ static int seek_to_sample_coarse(stb_vorbis *f, uint32 sample_number)
       skip(f, f->segments[i]);
 
    // start decoding (optimizable - this frame is generally discarded)
-   vorbis_pump_first_frame(f);
+   if (!vorbis_pump_first_frame(f))
+      return 0;
+   if (f->current_loc > sample_number)
+      return error(f, VORBIS_seek_failed);
    return 1;
 
 error:
@@ -4874,14 +4813,14 @@ int stb_vorbis_seek(stb_vorbis *f, unsigned int sample_number)
    return 1;
 }
 
-void stb_vorbis_seek_start(stb_vorbis *f)
+int stb_vorbis_seek_start(stb_vorbis *f)
 {
-   if (IS_PUSH_MODE(f)) { error(f, VORBIS_invalid_api_mixing); return; }
+   if (IS_PUSH_MODE(f)) { return error(f, VORBIS_invalid_api_mixing); }
    set_file_offset(f, f->first_audio_page_offset);
    f->previous_length = 0;
    f->first_decode = TRUE;
    f->next_seg = -1;
-   vorbis_pump_first_frame(f);
+   return vorbis_pump_first_frame(f);
 }
 
 unsigned int stb_vorbis_stream_length_in_samples(stb_vorbis *f)
@@ -4995,7 +4934,7 @@ stb_vorbis * stb_vorbis_open_file_section(FILE *file, int close_on_free, int *er
    stb_vorbis *f, p;
    vorbis_init(&p, alloc);
    p.f = file;
-   p.f_start = ftell(file);
+   p.f_start = (uint32) ftell(file);
    p.stream_len   = length;
    p.close_on_free = close_on_free;
    if (start_decoder(&p)) {
@@ -5014,9 +4953,9 @@ stb_vorbis * stb_vorbis_open_file_section(FILE *file, int close_on_free, int *er
 stb_vorbis * stb_vorbis_open_file(FILE *file, int close_on_free, int *error, const stb_vorbis_alloc *alloc)
 {
    unsigned int len, start;
-   start = ftell(file);
+   start = (unsigned int) ftell(file);
    fseek(file, 0, SEEK_END);
-   len = ftell(file) - start;
+   len = (unsigned int) (ftell(file) - start);
    fseek(file, start, SEEK_SET);
    return stb_vorbis_open_file_section(file, close_on_free, error, alloc, len);
 }
@@ -5046,6 +4985,7 @@ stb_vorbis * stb_vorbis_open_memory(const unsigned char *data, int len, int *err
       if (f) {
          *f = p;
          vorbis_pump_first_frame(f);
+         if (error) *error = VORBIS__no_error;
          return f;
       }
    }
@@ -5411,6 +5351,10 @@ int stb_vorbis_get_samples_float(stb_vorbis *f, int channels, float **buffer, in
 #endif // STB_VORBIS_NO_PULLDATA_API
 
 /* Version history
+    1.10    - 2017/03/03 - more robust seeking; fix negative ilog(); clear error in open_memory
+    1.09    - 2016/04/04 - back out 'avoid discarding last frame' fix from previous version
+    1.08    - 2016/04/02 - fixed multiple warnings; fix setup memory leaks;
+                           avoid discarding last frame of audio data
     1.07    - 2015/01/16 - fixed some warnings, fix mingw, const-correct API
                            some more crash fixes when out of memory or with corrupt files 
     1.06    - 2015/08/31 - full, correct support for seeking API (Dougall Johnson)
@@ -5460,3 +5404,46 @@ int stb_vorbis_get_samples_float(stb_vorbis *f, int channels, float **buffer, in
 */
 
 #endif // STB_VORBIS_HEADER_ONLY
+
+
+/*
+------------------------------------------------------------------------------
+This software is available under 2 licenses -- choose whichever you prefer.
+------------------------------------------------------------------------------
+ALTERNATIVE A - MIT License
+Copyright (c) 2017 Sean Barrett
+Permission is hereby granted, free of charge, to any person obtaining a copy of 
+this software and associated documentation files (the "Software"), to deal in 
+the Software without restriction, including without limitation the rights to 
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+of the Software, and to permit persons to whom the Software is furnished to do 
+so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all 
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
+SOFTWARE.
+------------------------------------------------------------------------------
+ALTERNATIVE B - Public Domain (www.unlicense.org)
+This is free and unencumbered software released into the public domain.
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute this 
+software, either in source code form or as a compiled binary, for any purpose, 
+commercial or non-commercial, and by any means.
+In jurisdictions that recognize copyright laws, the author or authors of this 
+software dedicate any and all copyright interest in the software to the public 
+domain. We make this dedication for the benefit of the public at large and to 
+the detriment of our heirs and successors. We intend this dedication to be an 
+overt act of relinquishment in perpetuity of all present and future rights to 
+this software under copyright law.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN 
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION 
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+------------------------------------------------------------------------------
+*/
